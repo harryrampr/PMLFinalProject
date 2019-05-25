@@ -1,0 +1,403 @@
+---
+title: "PML Course Final Project"
+author: "Harry Ramirez"
+date: "May 25, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(plyr)
+library(dplyr)
+library(caret)
+library(recipes)
+library(randomForest)
+library(doMC)
+options(width = 110)
+#setwd("~/Documents/DataScience/Coursera/R Files/Practical Machine Learning/FinalProject/PMLFinalProject")
+```
+
+## Summary
+The goal of the project was to classify the way participants were doing an specific exercise by features created from the data of four sensors. Figure 1 shows were the sensors where attached. More details about how the data was recorded and features created can be found at [Qualitative Activity Recognition of Weight Lifting Exercises](http://web.archive.org/web/20170519033209/http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf).
+
+<div>
+<center>
+![](on-body-sensing-schema.png)
+<br>
+Figure 1
+</center>
+</div>
+<br>
+
+Our approach to complete the project was:
+
+1. Download and explore the data
+2. Clean the data
+3. Select features
+4. Select model type and parameters
+5. Generate final model
+6. Predict the test data
+  
+## Data Exploration
+Data was downloaded from [training data](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv) and [testing data](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv):
+
+```{r loadData}
+trainingRaw <- read.csv("pml-training.csv", stringsAsFactors=FALSE)
+testingRaw <- read.csv("pml-testing.csv", stringsAsFactors=FALSE)
+
+dim(trainingRaw)
+table(sapply(trainingRaw, class))
+#head(trainingRaw, 1)
+
+dim(testingRaw)
+table(sapply(testingRaw, class))
+```
+
+For some reason, a high amount of features were read as character or logic type when they were truly numeric. Our conclusion was that the data needed extensive cleaning in order to proceed.
+
+## Data Cleaning
+The following code was used to remove *"DIV/0!"* warnings withing the data. Columns with more than 95% unavailable values were identified.
+```{r cleaningData1, results= "hide"}
+
+irrelevantCols <- names(trainingRaw)[1:7]
+responseCol <- "classe"
+
+nonNumericCols <- trainingRaw %>% 
+    select(-c(irrelevantCols, responseCol))
+nonNumericCols <- names(nonNumericCols)[!sapply(nonNumericCols, is.numeric)]
+
+# Convert to numeric data cols with data entry errors
+for(i in nonNumericCols) {
+    colValues <- trainingRaw[, i]
+    print(i)
+    print(table(colValues[colValues == "" | colValues == "#DIV/0!"]))
+    cat("\n")
+    colValues[colValues == ""] <- NA
+    colValues[colValues == "#DIV/0!"] <- NA
+    print(summary(as.numeric(colValues)))
+    trainingRaw[, i] <- as.numeric(colValues)
+    cat("\n\n")
+}
+
+# Find cols with more than 95% Na's
+colsToCheck <- trainingRaw %>% 
+    select(-c(irrelevantCols, responseCol)) %>% 
+    names()
+highNAsCols <- character()
+for(i in colsToCheck) {
+    naPercent <- mean(is.na(trainingRaw[, i]))
+    print(paste0(i," Na's percent:", naPercent))
+    if(naPercent > 0.95) {
+        highNAsCols <- c(highNAsCols, i)
+    }
+    cat("\n")
+}
+```
+Our decision was to discard columns with more than 95% unavailable values:
+```{r cleaningData2}
+length(highNAsCols)
+
+training <- trainingRaw %>% 
+    select(-c(irrelevantCols, highNAsCols))
+
+training$classe <- factor(training$classe)
+
+testing <- testingRaw %>% 
+    select(-c(irrelevantCols, highNAsCols))
+
+dim(training)
+table(sapply(training, class))
+head(training, 1)
+
+dim(testing)
+table(sapply(testing, class))
+```
+
+The result of the data cleaning process was 52 features plus the outcome variable. Our next step was to evaluate how correlated were the independent variables.
+
+```{r varCor, echo=FALSE, fig.height=6.5, fig.align="center"}
+MyCorPlot <- function(data, sig.level = 0.05, label = TRUE) {
+    library(ggcorrplot)
+    MyTheme <- function () { 
+        theme_gray(base_size = 12) %+replace% 
+            theme(
+                # change stuff here
+                plot.title = element_text(hjust = 0.5, size = 16, vjust = 1, lineheight = 0.20)
+            )
+    }
+    corr <- round(cor(data), 2)
+    p.mat <- cor_pmat(data)
+    # https://cran.r-project.org/web/packages/ggcorrplot/ggcorrplot.pdf
+    ggcorrplot(corr, p.mat = p.mat, hc.order = TRUE, title = "Features Correlation Plot\n",
+               outline.col = "gray", ggtheme = MyTheme, type = "lower", 
+               insig = "blank", lab = label, lab_col = "#aaaaaabb", 
+               lab_size = 3.5, sig.level = 0.05, tl.cex = 8)
+}
+
+MyCorPlot(training[,-53], label = FALSE)
+```
+  
+Since the chart showed high correlation between some variables and there was a large amount of features available, our strategy was to exclude features that had a correlation of over 0.80. Caret's *findCorrelation* function was used:
+
+```{r highlyCorr}
+highlyCorr <- findCorrelation(cor(training[,-53]), cutoff = 0.80, verbose = F, names = T)
+
+training <- training %>% 
+    select(-c(highlyCorr))
+
+dim(training)
+names(training)
+```
+After removing the highly correlated variables, the result was 39 features plus the outcome variable. At this point the options were to include all 39 features on the prediction model or doing additional feature selection. The feature selection option was going to be time consuming in terms of coding and processing time. Several models needed to be evaluated, but there was a chance of getting better predictions on new data with a more parsimonious model.
+
+## Feature Selection
+We used a custom implementation of caret's *rfe* function and random forest for feature selection. Since hundreds of models were evaluated, even with parallel processing, the code took overnight to run. Here is our code for Recursive Feature Elimination (RFE):
+
+```{r rfeCode, eval=FALSE}
+library(caret)
+library(recipes)
+
+x <- training[, -ncol(training)]
+y <- training[, ncol(training)]
+x <- as.data.frame(x)
+
+# Set rfe parameters
+subsets <- c(15,17,19,21,23,25)
+
+PickSizeTolerance002 <- function (x, metric, tol = 0.2, maximize) {
+    pickSizeTolerance(x = x, metric = metric, tol = tol, maximize = maximize)
+}
+
+CaretFuncsFitForRecipes <- function (x, y, first, last, ...) {
+    dots <- list(...)
+    x <- as.data.frame(x)
+    x$OUTCOME_VALS <- y
+    trainRecipe <- recipe(OUTCOME_VALS ~ ., data = x)
+    if (!is.null(dots$trRecipe)) {
+        trainRecipe$steps <- dots$trRecipe$steps
+        dots$trRecipe <- NULL
+    }
+    do.call(train, args = c(list(x = trainRecipe, data = x), dots))
+}
+
+myCaretFuncs <- caretFuncs
+myCaretFuncs$fit <- CaretFuncsFitForRecipes
+myCaretFuncs$selectSize <- PickSizeTolerance002
+
+myRfeControl <- rfeControl(functions = myCaretFuncs,
+                           rerank = T,
+                           method = "repeatedcv",
+                           number = 10,
+                           repeats = 1,
+                           verbose = TRUE,
+                           allowParallel = FALSE) # works better if enabled on trainControl
+
+myTrainCtrl <- trainControl(method = "repeatedcv",
+                            number = 10,
+                            repeats = 1,
+                            search = "random",
+                            allowParallel = TRUE)
+
+myTrainRecipe <- recipe(OUTCOME_VALS ~., data = cbind(x, OUTCOME_VALS = y)[1:3,]) %>% 
+    step_center(all_predictors()) %>%
+    step_scale(all_predictors())
+
+# Init parallel processing parameters
+library(doMC)
+registerDoMC(cores = parallel::detectCores() - 1)
+
+set.seed(10)
+rfeResults <- rfe(x, y,
+                 sizes = subsets,
+                 rfeControl = myRfeControl,
+                 method = "rf",
+                 trRecipe = myTrainRecipe, # update recipe as necesarry
+                 metric = "Accuracy",
+                 maximize = TRUE,
+                 trControl = myTrainCtrl,
+                 tuneLength = 3,
+                 importance = TRUE) # rf by default does not calculate importance
+
+save(rfeResults, file = "rfeResults.rda")
+```
+RFE results were interesting and promising:
+```{r loadRFEModel}
+load("rfeResults.rda")
+rfeResults
+
+selectedFeatures <- predictors(rfeResults)
+length(selectedFeatures)
+selectedFeatures
+```
+Our strategy with RFE was not to select the most accurate model. Instead, the simplest model within a 0.2 tolerance of the most accurate was selected. The result was a 21 features model with a cross-validated accuracy of 0.9940.
+
+## Prediction Models
+Since accuracy on RFE using random forest was so high, we decided to continue using random forest as the model type for prediction. Part of the training data (i.e. 20%) was set apart for validation purposes. To have a better approximation of model's accuracy using new data, a 10 fold cross-validation was used. This type of cross-validation preserved a balance between bias and variance during model's parameter fine tuning.
+
+```{r Pred1}
+set.seed(123)
+inValidationSubset <- createDataPartition(training$classe, p = 0.20, list = F)
+
+myTrainCtrl1 <- trainControl(method = "repeatedcv",
+                            number = 10,
+                            repeats = 1,
+                            search = "random",
+                            allowParallel = TRUE)
+
+myTrainRecipe <- recipe(classe ~., data = training[1:3,c(selectedFeatures, responseCol)]) %>% 
+    step_center(all_predictors()) %>%
+    step_scale(all_predictors())
+
+# Init parallel processing parameters
+registerDoMC(cores = parallel::detectCores() - 2)
+```
+Here is the code for the first model we trained:
+```{r Pred2, eval=FALSE}
+set.seed(25)
+train1 <- train(myTrainRecipe, 
+                data = training[-inValidationSubset, c(selectedFeatures, responseCol)], 
+                method = "rf",
+                trControl = myTrainCtrl1,
+                tuneLength = 3)
+
+save(train1, file = "train1.rda")
+```
+The results using caret's *search = "random"* were quite good:
+```{r Pred3}
+load(file = "train1.rda")
+train1
+validationPred1 <- predict(train1, training[inValidationSubset,])
+mean(validationPred1 == training[inValidationSubset,responseCol])
+```
+Bellow is the code for extra fine tuning on the *mtry* parameter:
+```{r Pred4, eval=FALSE}
+myTrainCtrl2 <- myTrainCtrl1
+myTrainCtrl2$search = "grid"
+myGrid <-  expand.grid(mtry = 4:6)
+set.seed(25)
+train2 <- train(myTrainRecipe, 
+                data = training[-inValidationSubset, c(selectedFeatures, responseCol)], 
+                method = "rf",
+                trControl = myTrainCtrl2,
+                tuneGrid = myGrid)
+
+save(train2, file = "train2.rda")
+```
+By using *mtry = 5*, we were able to get an slightly better (0.9922273 vs. 0.9921637) cross-validation accuracy:
+```{r Pred5}
+load(file = "train2.rda")
+train2
+validationPred2 <- predict(train2, training[inValidationSubset,])
+mean(validationPred2 == training[inValidationSubset,responseCol])
+```
+A simpler model, using less trees for the random forest, may give better out of bag accuracy. Here is the code for fine tuning on the *ntree* parameter:
+```{r Pred6, eval=FALSE}
+set.seed(25)
+train3 <- train(myTrainRecipe, 
+                data = training[-inValidationSubset, c(selectedFeatures, responseCol)], 
+                method = "rf",
+                trControl = myTrainCtrl2,
+                tuneGrid = myGrid,
+                ntree = 150)
+
+set.seed(25)
+train4 <- train(myTrainRecipe, 
+                data = training[-inValidationSubset, c(selectedFeatures, responseCol)], 
+                method = "rf",
+                trControl = myTrainCtrl2,
+                tuneGrid = myGrid,
+                ntree = 250)
+
+save(train3, file = "train3.rda")
+save(train4, file = "train4.rda")
+```
+Results for a simpler model using only 150 trees were more accurate (0.9924821 vs. 0.9922273) than caret's default of 500 trees:
+```{r Pred7}
+load(file = "train3.rda") # 150 trees
+train3
+validationPred3 <- predict(train3, training[inValidationSubset,])
+mean(validationPred3 == training[inValidationSubset,responseCol])
+
+load(file = "train4.rda") # 250 trees
+train4
+validationPred4 <- predict(train4, training[inValidationSubset,])
+mean(validationPred4 == training[inValidationSubset,responseCol])
+
+```
+The results from the previous models showed that a Random Forest with 150 trees and mtry between 4:5 was a good model for the application. Accuracies of over 99% were obtained on validation data and 10 fold cross-validation with these parameters.
+
+We used all the original training data (aka. training + validation) to do some minor fine tunning prior to generating the final model, here is the code:
+```{r Pred8, eval=FALSE}
+modelTrainCtrl <- trainControl(method = "repeatedcv",
+                            number = 10,
+                            repeats = 1,
+                            search = "grid",
+                            allowParallel = TRUE)
+
+modelGrid <-  expand.grid(mtry = 3:6)
+set.seed(25)
+trainAllData <- train(myTrainRecipe, 
+                data = training[, c(selectedFeatures, responseCol)], 
+                method = "rf",
+                trControl = modelTrainCtrl,
+                tuneGrid = modelGrid,
+                ntree = 150,
+                importance = TRUE)
+
+save(trainAllData, file = "trainAllData.rda")
+```
+The best results (0.9939866) were obtained using *mtry = 4* and *ntree = 150*:
+```{r Pred9}
+load(file = "trainAllData.rda")
+trainAllData
+```
+## Final Prediction Model
+Here is the code used to generate the final model using all the training data with parameters *mtry = 4* and *ntree = 150*:
+```{r Pred10, eval=FALSE}
+myTrainRecipe <- recipe(classe ~., data = training[1:3,c(selectedFeatures, responseCol)]) %>% 
+    step_center(all_predictors()) %>%
+    step_scale(all_predictors())
+
+modelTrainCtrl <- trainControl(method = "repeatedcv",
+                            number = 10,
+                            repeats = 3,
+                            search = "grid",
+                            allowParallel = TRUE)
+
+modelGrid <-  expand.grid(mtry = 4)
+set.seed(25)
+finalModel <- train(myTrainRecipe, 
+                data = training[, c(selectedFeatures, responseCol)], 
+                method = "rf",
+                trControl = modelTrainCtrl,
+                tuneGrid = modelGrid,
+                ntree = 150,
+                importance = TRUE)
+
+save(finalModel, file = "finalModel.rda")
+```
+A cross-validated accuracy of **0.9941** was obtained for the final model:
+```{r Pred11}
+load(file = "finalModel.rda")
+finalModel
+```
+
+The following code extracts feature importance from the final model:
+```{r VarImp}
+varImportance <- varImp(finalModel)$importance %>% 
+    mutate(Feature = rownames(.)) %>% 
+    mutate(Overall = rowMeans(.[,-ncol(.)])) %>%
+    mutate(Importance = Overall / sum(Overall) * 100) %>% 
+    arrange(desc(Importance)) %>% 
+    select(c("Feature", "Importance"))
+
+varImportance
+```
+Here is our prediction for the testing data:
+```{r PredData}
+testPrediction <- data.frame(prediction = predict(finalModel, newdata = testing))
+testPrediction <- cbind(testing[, ncol(testing), drop = FALSE], testPrediction)
+# Next line was commented to hide quiz answers
+#testPrediction
+```
+
